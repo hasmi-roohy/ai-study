@@ -1,5 +1,6 @@
 import './globals.css';
 import Providers from '@/components/Providers';
+import { SpeedInsights } from '@vercel/speed-insights/next';
 
 export const metadata = {
   title: 'AI Study Companion',
@@ -15,6 +16,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en">
       <body>
         <Providers>{children}</Providers>
+        <SpeedInsights />
       </body>
     </html>
   );
