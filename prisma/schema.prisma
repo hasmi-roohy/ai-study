@@ -1,0 +1,368 @@
+// AI Study Companion — Prisma schema
+// Design notes:
+// - Every content-owning table carries userId (directly or via Project) for isolation.
+// - JSON columns are used for flexible AI-generated structured data (validated at the app layer with zod).
+// - Activity + AIUsageLog + Job tables exist for observability / admin dashboard / analytics.
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+model User {
+  id            String    @id @default(uuid())
+  email         String    @unique
+  passwordHash  String
+  name          String?
+  role          Role      @default(USER)
+  createdAt     DateTime  @default(now())
+  lastActiveAt  DateTime  @default(now())
+
+  spaces          Space[]
+  learningContext LearningContext[]
+  activities      Activity[]
+  aiUsageLogs     AIUsageLog[]
+}
+
+model Space {
+  id          String   @id @default(uuid())
+  userId      String
+  name        String
+  description String?
+  color       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projects Project[]
+
+  @@index([userId])
+}
+
+model Project {
+  id           String   @id @default(uuid())
+  spaceId      String
+  userId       String   // denormalized for fast ownership checks / isolation
+  name         String
+  description  String?
+  goal         String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  lastAccessedAt DateTime @default(now())
+
+  space           Space             @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  materials       Material[]
+  concepts        Concept[]
+  conversations   Conversation[]
+  quizzes         Quiz[]
+  assessments     Assessment[]
+  recommendations Recommendation[]
+  learningContext LearningContext[]
+  activities      Activity[]
+
+  @@index([spaceId])
+  @@index([userId])
+}
+
+enum MaterialStatus {
+  QUEUED
+  PROCESSING
+  READY
+  FAILED
+}
+
+model Material {
+  id          String         @id @default(uuid())
+  projectId   String
+  userId      String
+  filename    String
+  storagePath String
+  mimeType    String
+  status      MaterialStatus @default(QUEUED)
+  failureReason String?
+  pageCount   Int?
+  createdAt   DateTime       @default(now())
+  processedAt DateTime?
+
+  project Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  chunks  Chunk[]
+
+  @@index([projectId])
+  @@index([status])
+}
+
+// A retrievable unit of content, with an embedding for semantic search.
+model Chunk {
+  id          String   @id @default(uuid())
+  materialId  String
+  projectId   String   // denormalized so retrieval can filter by project without a join
+  content     String
+  page        Int?
+  embedding   Float[]  // simple vector; swap for pgvector column type in production
+  createdAt   DateTime @default(now())
+
+  material Material @relation(fields: [materialId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@index([materialId])
+}
+
+model Concept {
+  id          String   @id @default(uuid())
+  projectId   String
+  name        String
+  description String?
+  masteryPct  Int      @default(0)
+  previousMasteryPct Int @default(0)
+  trend       String   @default("STABLE") // IMPROVING | STABLE | NEEDS_ATTENTION
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  project     Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  assessments AssessmentQuestion[]
+
+  @@unique([projectId, name])
+  @@index([projectId])
+}
+
+model Conversation {
+  id        String   @id @default(uuid())
+  projectId String
+  userId    String
+  title     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project  Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  messages Message[]
+
+  @@index([projectId])
+}
+
+enum MessageRole {
+  USER
+  ASSISTANT
+}
+
+model Message {
+  id             String      @id @default(uuid())
+  conversationId String
+  role           MessageRole
+  content        String
+  citations      Json?       // [{ materialId, filename, page, snippet }]
+  grounded       Boolean     @default(true)
+  createdAt      DateTime    @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId])
+}
+
+enum QuizStatus {
+  IN_PROGRESS
+  COMPLETED
+  ABANDONED
+}
+
+model Quiz {
+  id        String     @id @default(uuid())
+  projectId String
+  userId    String
+  status    QuizStatus @default(IN_PROGRESS)
+  createdAt DateTime   @default(now())
+  completedAt DateTime?
+
+  project   Project              @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  questions AssessmentQuestion[]
+
+  @@index([projectId])
+}
+
+enum QuestionType {
+  MULTIPLE_CHOICE
+  OPEN_ENDED
+}
+
+model AssessmentQuestion {
+  id            String       @id @default(uuid())
+  quizId        String
+  conceptId     String?
+  type          QuestionType
+  difficulty    Int          @default(2) // 1-5
+  prompt        String
+  options       Json?        // for multiple choice: string[]
+  correctOption String?
+  userAnswer    String?
+  isCorrect     Boolean?
+  aiFeedback    Json?        // { understanding, accuracy, missingConcepts, feedbackText }
+  answeredAt    DateTime?
+  createdAt     DateTime     @default(now())
+
+  quiz    Quiz     @relation(fields: [quizId], references: [id], onDelete: Cascade)
+  concept Concept? @relation(fields: [conceptId], references: [id])
+
+  @@index([quizId])
+  @@index([conceptId])
+}
+
+model Assessment {
+  id        String   @id @default(uuid())
+  projectId String
+  quizId    String?
+  summary   Json     // aggregate result of a completed quiz: accuracy, conceptsCovered, etc.
+  createdAt DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+}
+
+model Recommendation {
+  id        String   @id @default(uuid())
+  projectId String
+  text      String
+  reason    Json?    // structured trace of what evidence led to this recommendation
+  dismissed Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+}
+
+// Persistent learner context — long-term memory distinct from a single conversation.
+enum ContextType {
+  GOAL
+  PREFERENCE
+  STRENGTH
+  WEAKNESS
+  HISTORY
+  TUTOR_NOTE
+  ASSESSMENT_NOTE
+}
+
+model LearningContext {
+  id        String      @id @default(uuid())
+  userId    String
+  projectId String?     // null = global/user-level context
+  type      ContextType
+  content   String
+  relevance Float       @default(1.0) // for pruning/retrieval ranking
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([projectId])
+}
+
+// Append-only event log driving activity feeds, analytics, and downstream workflows.
+model Activity {
+  id        String   @id @default(uuid())
+  userId    String
+  projectId String?
+  type      String   // e.g. MATERIAL_UPLOADED, QUIZ_COMPLETED, TUTOR_QUESTION_ASKED
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([projectId])
+  @@index([type])
+  @@index([createdAt])
+}
+
+// Background job queue (simple DB-backed queue for the prototype).
+enum JobStatus {
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+model Job {
+  id           String    @id @default(uuid())
+  type         String    // PROCESS_MATERIAL, GENERATE_RECOMMENDATION, RUN_EVALUATION, etc.
+  payload      Json
+  status       JobStatus @default(QUEUED)
+  attempts     Int       @default(0)
+  maxAttempts  Int       @default(3)
+  lastError    String?
+  idempotencyKey String? @unique
+  createdAt    DateTime  @default(now())
+  startedAt    DateTime?
+  completedAt  DateTime?
+
+  @@index([status])
+  @@index([type])
+}
+
+// Observability: every AI provider call is logged for cost/latency/quality tracking.
+model AIUsageLog {
+  id            String   @id @default(uuid())
+  userId        String?
+  feature       String   // TUTOR, QUIZ_GENERATION, GRADING, RECOMMENDATION, EMBEDDING, EVALUATION
+  model         String
+  promptVersion String?
+  inputTokens   Int?
+  outputTokens  Int?
+  latencyMs     Int?
+  costUsd       Float?
+  success       Boolean
+  errorMessage  String?
+  createdAt     DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([feature])
+  @@index([createdAt])
+}
+
+// AI evaluation harness: stores test cases and run results for regression tracking.
+model EvalCase {
+  id        String   @id @default(uuid())
+  suite     String   // TUTOR_GROUNDEDNESS, TUTOR_UNSUPPORTED, QUIZ_QUALITY, GRADING_QUALITY, RECOMMENDATION
+  input     Json
+  expected  Json?
+  createdAt DateTime @default(now())
+
+  results EvalResult[]
+}
+
+model EvalRun {
+  id        String   @id @default(uuid())
+  suite     String
+  promptVersion String?
+  createdAt DateTime @default(now())
+
+  results EvalResult[]
+}
+
+model EvalResult {
+  id        String   @id @default(uuid())
+  runId     String
+  caseId    String
+  passed    Boolean
+  score     Float?
+  details   Json?
+  createdAt DateTime @default(now())
+
+  run  EvalRun  @relation(fields: [runId], references: [id], onDelete: Cascade)
+  case EvalCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
+
+  @@index([runId])
+  @@index([caseId])
+}
